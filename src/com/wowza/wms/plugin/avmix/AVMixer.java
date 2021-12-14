@@ -110,8 +110,12 @@ public class AVMixer
 		}
 		if (outputStream != null && outputStream.isRunning())
 		{
-			outputStream.setVideoName(videoName);
-			outputStream.setAudioName(audioName);
+			if (videoName.equals(audioName)) {
+				outputStream.setAudioVideoName(videoName);
+			} else {
+				outputStream.setVideoName(videoName);
+				outputStream.setAudioName(audioName);
+			}
 			ret += "Updating Output Stream: " + outputName + ". Video Source set to " + videoName + ". Audio Source set to " + audioName + ". ";
 		}
 		else
@@ -241,7 +245,7 @@ public class AVMixer
 		{
 			for (StreamInfo streamInfo : streamNames.values())
 			{
-				if (streamInfo.getVideoName().equals(streamName))
+				if (streamInfo.getVideoName()!=null && streamInfo.getVideoName().equals(streamName))
 				{
 					OutputStream outputStream = outputStreams.get(streamInfo.getOutputName());
 					if (outputStream != null)
@@ -250,7 +254,7 @@ public class AVMixer
 						logger.info(CLASS_NAME + ".removeStream [" + appInstance.getContextStr() + ": Video Source: " + streamName + " removed from " + streamInfo.getOutputName() + "]");
 					}
 				}
-				if (streamInfo.getAudioName().equals(streamName))
+				if (streamInfo.getAudioName()!=null && streamInfo.getAudioName().equals(streamName))
 				{
 					OutputStream outputStream = outputStreams.get(streamInfo.getOutputName());
 					if (outputStream != null)
@@ -278,8 +282,12 @@ public class AVMixer
 		}
 		if (outputStream != null && outputStream.isRunning())
 		{
-			outputStream.setVideoName(videoName);
-			outputStream.setAudioName(audioName);
+			if (videoName.equals(audioName)) {
+				outputStream.setAudioVideoName(videoName);
+			} else {
+				outputStream.setVideoName(videoName);
+				outputStream.setAudioName(audioName);
+			}
 			ret = "Output Stream Updated: [" + appInstance.getContextStr() + "/" + outputName + " Video Source: " + videoName + ", Audio Source: " + audioName + "]. ";
 		}
 		else
@@ -287,8 +295,12 @@ public class AVMixer
 			synchronized(lock)
 			{
 				outputStream = new OutputStream(appInstance, outputName, System.currentTimeMillis(), sortDelay, useOriginalTimecodes);
-				outputStream.setVideoName(videoName);
-				outputStream.setAudioName(audioName);
+				if (videoName.equals(audioName)) {
+					outputStream.setAudioVideoName(videoName);
+				} else {
+					outputStream.setVideoName(videoName);
+					outputStream.setAudioName(audioName);
+				}
 				outputStream.setName("AVMixOutputStream: [" + appInstance.getContextStr() + "/" + outputName + "]");
 				outputStream.setDaemon(true);
 				outputStream.start();
@@ -318,8 +330,7 @@ public class AVMixer
 			}
 			else
 			{
-				outputStream.setVideoName(null);
-				outputStream.setAudioName(null);
+				outputStream.setAudioVideoName(null);
 			}
 			ret = "Stopping Output Stream: " + appInstance.getContextStr() + "/" + outputName + ". Delayed: " + !shuttingDown;
 		}

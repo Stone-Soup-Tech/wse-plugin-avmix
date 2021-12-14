@@ -1,774 +1,731 @@
-/*
- * This code and all components (c) Copyright 2006 - 2018, Wowza Media Systems, LLC. All rights reserved.
- * This code is licensed pursuant to the Wowza Public License version 1.0, available at www.wowza.com/legal.
- */
 package com.wowza.wms.plugin.avmix;
 
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.text.MessageFormat;
+import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.Iterator;
 import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Queue;
 
-import com.wowza.util.FLVUtils;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.rabbitmq.client.Channel;
+import com.stonesoup.RabbitSingleton;
+import com.stonesoup.switching.MessageType;
+import com.stonesoup.switching.StreamConfirmData;
+import com.stonesoup.switching.StreamConfirmMessage;
+import com.stonesoup.switching.StreamCreatorConsumer;
 import com.wowza.wms.amf.AMFPacket;
 import com.wowza.wms.application.IApplicationInstance;
 import com.wowza.wms.logging.WMSLogger;
 import com.wowza.wms.logging.WMSLoggerFactory;
-import com.wowza.wms.logging.WMSLoggerIDs;
 import com.wowza.wms.stream.IMediaStream;
 import com.wowza.wms.stream.IMediaStreamMetaDataProvider;
+import com.wowza.wms.stream.publish.PlaylistItem;
 import com.wowza.wms.stream.publish.Publisher;
+import com.wowza.wms.stream.publish.Stream;
 import com.wowza.wms.vhost.IVHost;
 
-public class OutputStream extends Thread
-{
-	class PacketComparator implements Comparator<AMFPacket>
-	{
-
-		@Override
-		public int compare(AMFPacket thisPacket, AMFPacket otherPacket)
-		{
-			if (thisPacket == otherPacket)
-				return 0;
-			return thisPacket.getAbsTimecode() > otherPacket.getAbsTimecode() ? 1 : -1;
-		}
-	}
-
-	public static final String CLASS_NAME = "OutputStream";
-
+public class OutputStream extends Thread {
+	
+	private static final Class<OutputStream> CLASS = OutputStream.class;
+	private static final String CLASS_NAME = CLASS.getName();
+	
 	private IApplicationInstance appInstance;
 	private WMSLogger logger;
-	private IMediaStream audioSource;
-	private IMediaStream videoSource;
-	private Publisher publisher;
-	private Queue<AMFPacket> packets = new PriorityQueue<AMFPacket>(16, new PacketComparator());
-
+	private boolean doQuit;
+	private boolean running = false;
+	
 	private String outputName;
 	private volatile String audioName;
 	private volatile String videoName;
-
-	private long startTime = -1;
-	private long delayOffset = -1;
-	private long audioOffset = -1;
-	private long videoOffset = -1;
-	private long sortDelay = 10000l;
-	private long flushInterval = 250;
+	private int sleepTime = 125;
+	private int idleShutdown = 2000;
+	private int idleTime = 0;
+	
+	private Publisher publisher = null;
+	private Queue<AMFPacket> packets = new PriorityQueue<AMFPacket>(16, new PacketComparator());
+	private IMediaStream audioSource;
+	private IMediaStream videoSource;
+	private IMediaStream nxtVideoSource;
 	private long audioSeq = -1;
 	private long videoSeq = -1;
-	private long lastTC = -1;
-	private long lastProcessedAudioTC = -1;
-	private long lastProcessedVideoTC = -1;
-	private long videoSwitchTimecode = -1;
-	private long audioSwitchTimecode = -1;
-
-	private boolean useOriginalTimecodes = false;
-	private boolean addAudioData = true;
-	private boolean addVideoData = true;
-	private boolean isFirstAudio = true;
-	private boolean isFirstVideo = true;
-	private boolean foundFirstAudio = false;
-	private boolean foundFirstVideo = false;
-	private boolean waitForKeyframe = true;
-	private boolean pendingVideoSwitch = false;
-
-	private boolean pendingAudioSwitch = false;
-	private boolean debugLog = false;
-	private boolean doQuit;
-	private boolean running = true;
-
-	public OutputStream(IApplicationInstance appInstance, String outputName, long startTime, long sortDelay, boolean useOriginalTimecodes)
-	{
+	private long switchTC = Long.MAX_VALUE;
+	private long audioTC = 0;
+	private long videoTC = 0;
+	private long videoTCOffset = 0;
+	private long audioTCOffset = 0;
+	
+	private final Object lock = new Object();
+	
+	private ObjectMapper json = new ObjectMapper();
+	private String routingKeyTemplate;
+	private String exchangeName;
+	private String serverName;
+	private String vHostName;
+	
+	private long maxSentAudioTC = Long.MIN_VALUE;
+	private long maxSentVideoTC = Long.MIN_VALUE;
+	
+	// constructor has more fields for backwards compatibility with the original Wowza AVMixer class
+	public OutputStream(IApplicationInstance appInstance, String outputName, long startTime, long sortDelay, boolean useOriginalTimecodes) {
 		this.appInstance = appInstance;
 		this.outputName = outputName;
-		this.startTime = startTime;
-		this.sortDelay = sortDelay;
-		this.useOriginalTimecodes = useOriginalTimecodes;
-		logger = WMSLoggerFactory.getLoggerObj(appInstance);
-
-		debugLog = appInstance.getProperties().getPropertyBoolean("avMixDebugLog", debugLog);
-		if (logger.isDebugEnabled())
-			debugLog = true;
+		
+		exchangeName = appInstance.getProperties().getPropertyStr("confirmationExchangeName");
+		routingKeyTemplate = appInstance.getProperties().getPropertyStr("confirmationRoutingKeyTemplate");
+		serverName = appInstance.getApplication().getVHost().getProperty("serverName");
+		vHostName = appInstance.getVHost().getName();
+		
+		logger = WMSLoggerFactory.getLogger(CLASS);
 	}
-
+	
 	@Override
-	public void run()
-	{
-		try
-		{
-			while (true)
-			{
-				synchronized(this)
-				{
-					if (doQuit)
-					{
-						if (debugLog)
-							logger.info(CLASS_NAME + ".run(): " + "[" + appInstance.getContextStr() + "/" + outputName + " doQuit]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-						running = false;
-						break;
-					}
-				}
-
-				processVideoSource();
-				processAudioSource();
-				processOutput();
-
-				synchronized(this)
-				{
-					long now = System.currentTimeMillis();
-
-					if (packets.isEmpty() && videoSource == null && audioSource == null)
-					{
-						if (sortDelay >= 0)
-						{
-							if (useOriginalTimecodes)
-							{
-								if (now - sortDelay > (lastTC == -1 ? startTime : lastTC + delayOffset))
-								{
-									if (debugLog)
-										logger.info(CLASS_NAME + ".run(): " + "[" + appInstance.getContextStr() + "/" + outputName + " shutdown : " + packets.size() + " : " + (now - sortDelay) + " : " + (lastTC + delayOffset) + " : " + startTime + "]", WMSLoggerIDs.CAT_application,
-												WMSLoggerIDs.EVT_comment);
-									running = false;
-									break;
-								}
-							}
-							else if (now - sortDelay > (lastTC == -1 ? startTime : lastTC))
-							{
-								if (debugLog)
-									logger.info(CLASS_NAME + ".run(): " + "[" + appInstance.getContextStr() + "/" + outputName + " shutdown : " + packets.size() + " : " + (now - sortDelay) + " : " + lastTC + " : " + startTime + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-								running = false;
-								break;
-							}
-						}
-						else
-						{
-							if (debugLog)
-								logger.info(CLASS_NAME + ".run(): " + "[" + appInstance.getContextStr() + "/" + outputName + " shutdown : empty packet list and no sources]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-							running = false;
-							break;
-						}
-					}
-				}
-
-				try
-				{
-					Thread.sleep(flushInterval);
-				}
-				catch (InterruptedException e)
-				{
-				}
-
-			}
-		}
-		catch (Exception e)
-		{
-			logger.error(CLASS_NAME + ".run() Exception: " + e.getMessage(), e);
-		}
-		finally
-		{
-			if (publisher != null)
-			{
-				publisher.unpublish();
-				publisher.close();
-			}
-			publisher = null;
-			running = false;
-		}
-	}
-
-	private void processVideoSource()
-	{
-		if (debugLog)
-			logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-
-		IMediaStream stream = appInstance.getStreams().getStream(videoName);
-		if (stream == null)
-		{
-			videoSource = null;
-			if (debugLog)
-				logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " video source not running]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-			return;
-		}
-
-		if (stream != videoSource)
-		{
-			if (videoSource != null)
-				pendingVideoSwitch = true;
-			if (pendingVideoSwitch && useOriginalTimecodes && waitForKeyframe)
-			{
-				AMFPacket newKey = stream.getLastKeyFrame();
-				if (videoSwitchTimecode == -1)
-				{
-					if (newKey != null && lastProcessedVideoTC != -1 && newKey.getAbsTimecode() > lastProcessedVideoTC)
-					{
-						videoSwitchTimecode = newKey.getAbsTimecode();
-						if (debugLog)
-							logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " setting switchTimecode " + videoSwitchTimecode + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-					}
-					else
-					{
-						if (debugLog)
-							logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " pending switch waiting for new stream to catch up " + (newKey != null ? newKey.getAbsTimecode() : 0) + ": " + lastProcessedVideoTC + "]",
-									WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-						return;
-					}
-				}
-			}
-			else
-			{
-				pendingVideoSwitch = false;
-			}
-
-			if (!pendingVideoSwitch)
-			{
-				videoSource = stream;
-				videoOffset = -1;
-				videoSeq = -1;
-				foundFirstVideo = false;
-				isFirstVideo = true;
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " video source reset]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-			}
-		}
-
-		List<AMFPacket> videoPackets = videoSource.getPlayPackets();
-		if (videoPackets == null || videoPackets.isEmpty())
-		{
-			if (debugLog)
-				logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " video source no packets]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-			return;
-		}
-
-		long startSeq = videoPackets.get(0).getSeq();
-		int startIdx = (videoSeq == -1 ? 0 : (int)(videoSeq - startSeq + 1));
-		if (startIdx < 0)
-			startIdx = 0;
-		if (startIdx >= videoPackets.size())
-			return;
-
-		if (!foundFirstVideo)
-		{
-			for (int idx = videoPackets.size() - 1; idx >= 0; idx--)
-			{
-				AMFPacket packet = videoPackets.get(idx);
-				if (!FLVUtils.isVideoKeyFrame(packet))
-				{
-					continue;
-				}
-
-				if (videoSwitchTimecode != -1 && packet.getAbsTimecode() != videoSwitchTimecode)
-				{
-					continue;
-				}
-				videoSwitchTimecode = -1;
-				foundFirstVideo = true;
-				startIdx = idx;
-
-				if (useOriginalTimecodes)
-				{
-					if (delayOffset == -1)
-						delayOffset = System.currentTimeMillis() - packet.getAbsTimecode();
-				}
-				else
-				{
-					videoOffset = System.currentTimeMillis() - packet.getAbsTimecode();
-					if (videoOffset + packet.getAbsTimecode() <= lastProcessedVideoTC)
-					{
-						videoOffset = (lastProcessedVideoTC + packet.getTimecode()) - packet.getAbsTimecode();
-					}
-				}
-
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " found video start. " + lastProcessedVideoTC + " : " + System.currentTimeMillis() + " : " + videoOffset + " : " + startIdx + "]", WMSLoggerIDs.CAT_application,
-							WMSLoggerIDs.EVT_comment);
-				break;
-			}
-
-			if (!foundFirstVideo)
-				return;
-		}
-
-		for (int idx = startIdx; idx < videoPackets.size(); idx++)
-		{
-			AMFPacket packet = videoPackets.get(idx);
-			int type = packet.getType();
-
-			if (type == IVHost.CONTENTTYPE_AUDIO)
-				continue;
-			if ((type == IVHost.CONTENTTYPE_DATA0 || type == IVHost.CONTENTTYPE_DATA3) && !addVideoData)
-				continue;
-
-			if (videoSwitchTimecode != -1 && packet.getAbsTimecode() >= videoSwitchTimecode)
-			{
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " (packet.getAbsTimecode() >= switchTimecode) " + packet + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				videoSource = null;
-				pendingVideoSwitch = false;
-				break;
-			}
-
-			long newTimecode = useOriginalTimecodes ? packet.getAbsTimecode() : videoOffset + packet.getAbsTimecode();
-
-			if (isFirstVideo && type == IVHost.CONTENTTYPE_VIDEO)
-			{
-				AMFPacket configPacket = videoSource.getVideoCodecConfigPacket(packet.getAbsTimecode());
-				if (configPacket != null)
-				{
-					AMFPacket newConfigPacket = new AMFPacket(IVHost.CONTENTTYPE_VIDEO, 0, configPacket.getData());
-					newConfigPacket.setAbsTimecode(newTimecode);
-					packets.add(newConfigPacket);
-					if (debugLog)
-						logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add video config packet. " + configPacket + " : " + newConfigPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				}
-
-				if (addVideoData)
-				{
-					while (true)
-					{
-						IMediaStreamMetaDataProvider metaDataProvider = videoSource.getMetaDataProvider();
-						if (metaDataProvider == null)
-							break;
-
-						List<AMFPacket> metaData = new ArrayList<AMFPacket>();
-
-						metaDataProvider.onStreamStart(metaData, packet.getAbsTimecode());
-
-						Iterator<AMFPacket> miter = metaData.iterator();
-						while (miter.hasNext())
-						{
-							AMFPacket metaPacket = miter.next();
-							if (metaPacket == null)
-								continue;
-
-							if (metaPacket.getSize() <= 0)
-								continue;
-
-							if (metaPacket.getData() == null)
-								continue;
-
-							AMFPacket newMetaPacket = new AMFPacket(IVHost.CONTENTTYPE_DATA, 0, metaPacket.getData());
-							newMetaPacket.setAbsTimecode(newTimecode);
-							packets.add(newMetaPacket);
-							if (debugLog)
-								logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add video metadata packet. " + metaPacket + " : " + newMetaPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-						}
-						break;
-					}
-
-				}
-				isFirstVideo = false;
-			}
-			
-			AMFPacket newPacket = new AMFPacket(type, 0, packet.getData());
-			newPacket.setAbsTimecode(newTimecode);
-			packets.add(newPacket);
-			if (debugLog)
-				logger.info(CLASS_NAME + ".processVideoSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add video packet. " + packet + " : " + newPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-
-			videoSeq = packet.getSeq();
-			lastProcessedVideoTC = newTimecode;
-		}
-
-	}
-
-	private void processAudioSource()
-	{
-		if (debugLog)
-			logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-
-		IMediaStream stream = appInstance.getStreams().getStream(audioName);
-		if (stream == null)
-		{
-			audioSource = null;
-			if (debugLog)
-				logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " audio source not running]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-			return;
-		}
-
-		if (stream != audioSource)
-		{
-			if (audioSource != null)
-				pendingAudioSwitch = true;
-			if (pendingAudioSwitch && useOriginalTimecodes)
-			{
-				long lastTimecode = stream.getAudioTC();
-				if (audioSwitchTimecode == -1)
-				{
-					if (lastProcessedAudioTC != -1 && lastTimecode > lastProcessedAudioTC)
-					{
-						audioSwitchTimecode = lastTimecode;
-						if (debugLog)
-							logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " setting switchTimecode " + audioSwitchTimecode + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-					}
-					else
-					{
-						if (debugLog)
-							logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " pending switch waiting for new stream to catch up " + lastTimecode + ": " + lastProcessedAudioTC + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-						return;
-					}
-				}
-			}
-			else
-			{
-				pendingAudioSwitch = false;
-			}
-
-			if (!pendingAudioSwitch)
-			{
-				audioSource = stream;
-				audioOffset = -1;
-				audioSeq = -1;
-				foundFirstAudio = false;
-				isFirstAudio = true;
-			}
-		}
-
-		List<AMFPacket> audioPackets = audioSource.getPlayPackets();
-		if (audioPackets == null || audioPackets.isEmpty())
-			return;
-
-		long startSeq = audioPackets.get(0).getSeq();
-		int startIdx = (audioSeq == -1 ? 0 : (int)(audioSeq - startSeq + 1));
-		if (startIdx < 0)
-			startIdx = 0;
-		if (startIdx >= audioPackets.size())
-			return;
-
-		if (!foundFirstAudio)
-		{
-			for (int idx = audioPackets.size() - 1; idx >= 0; idx--)
-			{
-				AMFPacket packet = audioPackets.get(idx);
-				if (!packet.isAudio())
-				{
-					continue;
-				}
-
-				if (audioSwitchTimecode != -1 && packet.getAbsTimecode() != audioSwitchTimecode)
-				{
-					continue;
-				}
-
-				audioSwitchTimecode = -1;
-				foundFirstAudio = true;
-				startIdx = idx;
-
-				if (useOriginalTimecodes)
-				{
-					if (delayOffset == -1)
-						delayOffset = System.currentTimeMillis() - packet.getAbsTimecode();
-				}
-				else
-				{
-					audioOffset = System.currentTimeMillis() - packet.getAbsTimecode();
-
-					if (audioOffset + packet.getAbsTimecode() <= lastProcessedAudioTC)
-					{
-						audioOffset = (lastProcessedAudioTC + packet.getTimecode()) - packet.getAbsTimecode();
-					}
-				}
-
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " found audio start. " + audioOffset + " : " + lastProcessedAudioTC + " : " + System.currentTimeMillis() + " : " + packet.getAbsTimecode() + "]",
-							WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-			}
-
-			if (!foundFirstAudio)
-				return;
-		}
-
-		for (int idx = startIdx; idx < audioPackets.size(); idx++)
-		{
-			AMFPacket packet = audioPackets.get(idx);
-			int type = packet.getType();
-
-			if (type == IVHost.CONTENTTYPE_VIDEO)
-				continue;
-			if ((type == IVHost.CONTENTTYPE_DATA0 || type == IVHost.CONTENTTYPE_DATA3) && !addAudioData)
-				continue;
-
-			if (audioSwitchTimecode != -1 && packet.getAbsTimecode() >= audioSwitchTimecode)
-			{
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " (packet.getAbsTimecode() >= switchTimecode) " + packet + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				audioSource = null;
-				pendingAudioSwitch = false;
-				break;
-			}
-
-			long newTimecode = useOriginalTimecodes ? packet.getAbsTimecode() : audioOffset + packet.getAbsTimecode();
-
-			if (isFirstAudio && type == IVHost.CONTENTTYPE_AUDIO)
-			{
-				AMFPacket configPacket = audioSource.getAudioCodecConfigPacket(packet.getAbsTimecode());
-				if (configPacket != null)
-				{
-					AMFPacket newConfigPacket = new AMFPacket(IVHost.CONTENTTYPE_AUDIO, 0, configPacket.getData());
-					newConfigPacket.setAbsTimecode(newTimecode);
-					packets.add(newConfigPacket);
-					if (debugLog)
-						logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add audio config packet. " + configPacket + " : " + newConfigPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				}
-
-				if (addAudioData)
-				{
-					while (true)
-					{
-						IMediaStreamMetaDataProvider metaDataProvider = audioSource.getMetaDataProvider();
-						if (metaDataProvider == null)
-							break;
-
-						List<AMFPacket> metaData = new ArrayList<AMFPacket>();
-
-						metaDataProvider.onStreamStart(metaData, packet.getAbsTimecode());
-
-						Iterator<AMFPacket> miter = metaData.iterator();
-						while (miter.hasNext())
-						{
-							AMFPacket metaPacket = miter.next();
-							if (metaPacket == null)
-								continue;
-
-							if (metaPacket.getSize() <= 0)
-								continue;
-
-							if (metaPacket.getData() == null)
-								continue;
-
-							AMFPacket newMetaPacket = new AMFPacket(IVHost.CONTENTTYPE_DATA, 0, metaPacket.getData());
-							newMetaPacket.setAbsTimecode(newTimecode);
-							packets.add(newMetaPacket);
-							if (debugLog)
-								logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add audio metadata packet. " + metaPacket + " : " + newMetaPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-						}
-						break;
-					}
-
-				}
-				isFirstAudio = false;
-			}
-			
-			AMFPacket newPacket = new AMFPacket(type, 0, packet.getData());
-			newPacket.setAbsTimecode(newTimecode);
-			packets.add(newPacket);
-			if (debugLog)
-				logger.info(CLASS_NAME + ".processAudioSource(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add audio packet. " + packet + " : " + newPacket + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-
-			audioSeq = packet.getSeq();
-			lastProcessedAudioTC = newTimecode;
-		}
-	}
-
-	private void processOutput()
-	{
-		if (debugLog)
-			logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-
-		long now = System.currentTimeMillis();
-
-		while (true)
-		{
-			AMFPacket packet = packets.peek();
-			if (packet == null)
-			{
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " no packets available]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-			}
-
-			if (useOriginalTimecodes)
-			{
-				if (sortDelay >= 0 && packet.getAbsTimecode() + delayOffset > now - sortDelay)
-				{
-					if (debugLog)
-						logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " no packets available. (packet.getAbsTimecode() + delayOffset > now - sortDelay) timecode: " + packet.getAbsTimecode() + ", delayOffset: " + delayOffset + ", now: " + now
-								+ ", sortDelay: " + sortDelay + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+	public void run() {
+		logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Starting to run");
+		running = true;
+		// avoid dirty shutdown due to error
+		try {
+			while (true) {
+				// shut down if requested
+				if (doQuit) {
+					logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Shutting down as requested");
+					shutDown();
 					break;
 				}
+				
+				// avoid changing stream names while running
+				synchronized (lock) {
+					// first treat the case where both audio and video come from the same stream
+					if (audioName!=null && videoName!=null && audioName.equals(videoName)) {
+						// logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] "+ ": Same video and audio on outputstream " + appInstance.getContextStr() + "/" + outputName);
+						IMediaStream stream = appInstance.getStreams().getStream(videoName);
+						if (stream == null) {
+							audioSource = null;
+							videoSource = null;
+							logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Stream name " + videoName +  " not playing. Nothing to play on video or audio");
+						} else {
+							// if a different source then the present one was requested
+							if ((stream!=videoSource || stream!=audioSource) && nxtVideoSource==null) {
+								// get the most recent frame from the stream
+								AMFPacket lastFrame = stream.getLastPacket();
+								// if there's at least a frame in the intended source video
+								if (lastFrame != null) {
+									logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio-video source change requested");
+									nxtVideoSource = stream;
+									// remember the timecode in the stream where the switch was requested
+									switchTC = lastFrame.getAbsTimecode();
+								}
+							}
+							
+							// if we are pending a switch
+							if (nxtVideoSource != null) {
+								// get the most recent keyframe from the next source
+								AMFPacket nxtKeyFrame = nxtVideoSource.getLastKeyFrame();
+								// if we don't have any keyframes in the video yet, there's nothing to do
+								if (nxtKeyFrame != null) {
+									// if the keyframe is after the switch timecode
+									if (nxtKeyFrame.getAbsTimecode() > switchTC) {
+										// do the switch
+										audioSource = stream;
+										videoSource = stream;
+										// create a copy of the packet, so we don't change the its data
+										AMFPacket packet = nxtKeyFrame.clone(true); 
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio-video source change performed");
+										// compute the timecode difference
+										videoTCOffset = videoTC - packet.getAbsTimecode() + 1;
+										// if the video timecode would bring the audio back in time
+										if (packet.getAbsTimecode() + videoTCOffset < audioTC) {
+											// then move it ahead a bit
+											videoTCOffset += audioTC - packet.getAbsTimecode() - videoTCOffset + 1;
+										}
+										audioTCOffset = videoTCOffset;
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Video timecode offset: " + videoTCOffset + ". Current video timecode: " + videoTC);
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio timecode offset: " + audioTCOffset + ". Current audio timecode: " + audioTC);
+										// communicate the switch
+										sendConfirmation(outputName, stream.getName(), stream.getName());
+										// start playing both audio and video starting with the keyframe
+										videoSeq = packet.getSeq();
+										videoTC = packet.getAbsTimecode() + videoTCOffset;
+										audioSeq = videoSeq;
+										audioTC = videoTC;
+										// send audio config packet
+										AMFPacket configPacket = stream.getAudioCodecConfigPacket(packet.getAbsTimecode());
+										if (configPacket != null) {
+											AMFPacket newPacket = configPacket.clone(true);
+											// set a timecode that doesn't interfere with others
+											newPacket.setAbsTimecode(packet.getAbsTimecode());
+											// update the packet's timecode
+											newPacket.setAbsTimecode(configPacket.getAbsTimecode() + audioTCOffset);
+											packets.add(newPacket);
+										}
+										// send video config packet
+										configPacket = stream.getVideoCodecConfigPacket(packet.getAbsTimecode());
+										if (configPacket != null) {
+											AMFPacket newPacket = configPacket.clone(true);
+											// set a timecode that doesn't interfere with others
+											newPacket.setAbsTimecode(packet.getAbsTimecode() + 1);
+											// update the packet's timecode
+											newPacket.setAbsTimecode(newPacket.getAbsTimecode() + videoTCOffset);
+											packets.add(newPacket);
+										}
+										// send metadata
+										IMediaStreamMetaDataProvider mdProvider = nxtVideoSource.getMetaDataProvider();
+										List<AMFPacket> metaData = new ArrayList<AMFPacket>();
+										mdProvider.onStreamStart(metaData, packet.getAbsTimecode());
+										metaData.forEach(mdPacket -> {
+											// if the packet exists and has data
+											if (mdPacket!=null && mdPacket.getSize()>0 && mdPacket.getData()!=null) {
+												AMFPacket newPacket = mdPacket.clone(true);
+												// set a timecode that doesn't interfere with others
+												newPacket.setAbsTimecode(packet.getAbsTimecode() + 2);
+												// update the packet's timecode
+												newPacket.setAbsTimecode(newPacket.getAbsTimecode() + videoTCOffset);
+												packets.add(newPacket);
+											}
+										});
+										// update the keyframe packet's timecode, so that it doesn't interfere with others
+										packet.setAbsTimecode(packet.getAbsTimecode() + videoTCOffset + 3);
+										// add the keyframe packet
+										packets.add(packet);
+										// reset the switch variables
+										nxtVideoSource = null;
+										switchTC = Long.MAX_VALUE;
+									}
+								} else {
+									logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Waiting for keyframe");
+								}
+							}
+						}
+					} else {
+						// if we have a video stream name
+						if (videoName != null) {
+							// different streams
+							IMediaStream videoStream = appInstance.getStreams().getStream(videoName);
+							// if the source video stream is running
+							if (videoStream == null) {
+								videoSource = null;
+								logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Stream name " + videoName +  " not playing. Nothing to play on video ");
+							} else {
+								// if a different source then the present one was requested
+								if (videoStream!=videoSource && nxtVideoSource==null) {
+									// get the most recent frame from the stream
+									AMFPacket lastFrame = videoStream.getLastPacket();
+									// if there's at least a frame in the intended source video
+									if (lastFrame != null) {
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Video source change requested");
+										nxtVideoSource = videoStream;
+										// remember the timecode in the stream where the switch was requested
+										switchTC = lastFrame.getAbsTimecode();
+									}
+								}
+								// if we are pending a switch
+								if (nxtVideoSource != null) {
+									// get the most recent keyframe from the next source
+									AMFPacket nxtKeyFrame = nxtVideoSource.getLastKeyFrame();
+									// if the keyframe is after the switch timecode
+									if (nxtKeyFrame!=null && nxtKeyFrame.getAbsTimecode() > switchTC) {
+										// do the switch
+										videoSource = videoStream;
+										// create a copy of the packet, so we don't change the its data
+										AMFPacket packet = nxtKeyFrame.clone(true); 
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Video source change performed");
+										// compute the timecode difference
+										videoTCOffset = videoTC - packet.getAbsTimecode() + 1;
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Video timecode offset: " + videoTCOffset + ". Current video timecode: " + videoTC);
+										// it's possible even if we only switch video now, we end up playing the same stream
+										// so we should syncronize the timecodes
+										if (audioSource!= null && videoSource.getName().equals(audioSource.getName())) {
+											audioTCOffset = videoTCOffset;
+											logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio timecode offset: " + audioTCOffset + ". Current audio timecode: " + audioTC);
+											
+										}
+										// communicate the switch
+										sendConfirmation(outputName, videoStream.getName(), null);
+										// start playing video starting with the keyframe
+										videoSeq = packet.getSeq();
+										videoTC = packet.getAbsTimecode() + videoTCOffset;
+										// send video config packet
+										AMFPacket configPacket = videoStream.getVideoCodecConfigPacket(packet.getAbsTimecode());
+										if (configPacket != null) {
+											// set a timecode that doesn't interfere with others
+											configPacket.setAbsTimecode(packet.getAbsTimecode());
+											// update the packet's timecode
+											configPacket.setAbsTimecode(configPacket.getAbsTimecode() + videoTCOffset);
+											packets.add(configPacket);
+										}
+										// send metadata
+										IMediaStreamMetaDataProvider mdProvider = nxtVideoSource.getMetaDataProvider();
+										List<AMFPacket> metaData = new ArrayList<AMFPacket>();
+										mdProvider.onStreamStart(metaData, packet.getAbsTimecode());
+										metaData.forEach(mdPacket -> {
+											// if the packet exists and has data
+											if (mdPacket!=null && mdPacket.getSize()>0 && mdPacket.getData()!=null) {
+												AMFPacket newPacket = new AMFPacket(IVHost.CONTENTTYPE_DATA, 0, mdPacket.getData());
+												// set a timecode that doesn't interfere with others
+												newPacket.setAbsTimecode(packet.getAbsTimecode() + 1);
+												// update the packet's timecode
+												newPacket.setAbsTimecode(newPacket.getAbsTimecode() + videoTCOffset);
+												packets.add(newPacket);
+											}
+										});
+										// update the packet's timecode, so that it doesn't interfere with others
+										packet.setAbsTimecode(packet.getAbsTimecode() + videoTCOffset + 2);
+										// add the keyframe packet
+										packets.add(packet);
+										// reset the switch variables
+										nxtVideoSource = null;
+										switchTC = Long.MAX_VALUE;
+									}
+								}
+							}
+						}
+						// if we have an audio stream name
+						if (audioName != null) {
+							// different streams
+							IMediaStream audioStream = appInstance.getStreams().getStream(audioName);
+							// if the source video stream is running
+							if (audioStream == null) {
+								audioSource = null;
+								logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Stream name " + audioName +  " not playing. Nothing to play on audio");
+							} else {
+								// if a different source then the present one was requested
+								if (audioStream != audioSource) {
+									// get the most recent frame from the stream
+									AMFPacket lastPacket = audioStream.getLastPacket();
+									// if there's at least a packet in the intended source audio
+									if (lastPacket != null) {
+										// do the switch
+										audioSource = audioStream;
+										// create a copy of the packet, so we don't change the its data
+										AMFPacket packet = lastPacket.clone(true); 
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio source change requested");
+										// remember the timecode in the stream where the switch was requested
+										packet.getAbsTimecode();
+										// there are no keyframes in audio, so simply perform the switch
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio source change performed");
+										// compute the timecode difference
+										audioTCOffset = audioTC - packet.getAbsTimecode() + 1;
+										logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio timecode offset: " + audioTCOffset);
+										// it's possible even if we only switch audio now, we end up playing the same stream
+										// so we should syncronize the timecodes
+										if (videoSource!=null && videoSource.getName().equals(audioSource.getName())) {
+											videoTCOffset = audioTCOffset;
+											logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Video timecode offset: " + videoTCOffset);
+											
+										}
+										// communicate the switch
+										sendConfirmation(outputName, null, audioStream.getName());
+										// start playing audio from the current frame
+										audioSeq = packet.getSeq();
+										audioTC = packet.getAbsTimecode() + audioTCOffset;
+										// send video config packet
+										AMFPacket configPacket = audioStream.getAudioCodecConfigPacket(packet.getAbsTimecode());
+										if (configPacket != null) {
+											// set a timecode that doesn't interfere with others
+											configPacket.setAbsTimecode(packet.getAbsTimecode());
+											// update the packet's timecode
+											configPacket.setAbsTimecode(configPacket.getAbsTimecode() + audioTCOffset);
+											packets.add(configPacket);
+										}
+										// send metadata
+										IMediaStreamMetaDataProvider mdProvider = audioStream.getMetaDataProvider();
+										List<AMFPacket> metaData = new ArrayList<AMFPacket>();
+										mdProvider.onStreamStart(metaData, packet.getAbsTimecode());
+										metaData.forEach(mdPacket -> {
+											// if the packet exists and has data
+											if (mdPacket!=null && mdPacket.getSize()>0 && mdPacket.getData()!=null) {
+												AMFPacket newPacket = new AMFPacket(IVHost.CONTENTTYPE_DATA, 0, mdPacket.getData());
+												// set a timecode that doesn't interfere with others
+												newPacket.setAbsTimecode(packet.getAbsTimecode() + 1);
+												// update the packet's timecode
+												newPacket.setAbsTimecode(newPacket.getAbsTimecode() + audioTCOffset);
+												packets.add(newPacket);
+											}
+										});
+										// update the packet's timecode, so it doesn't interfere with the others
+										packet.setAbsTimecode(packet.getAbsTimecode() + audioTCOffset + 2);
+										// add the current packet
+										packets.add(packet);
+									}
+								}
+							}
+						}
+					}
+				}
+				
+				// if we have the same source for video and audio
+				if (videoSource!=null && audioSource!=null && videoSource.getName().equals(audioSource.getName())) {
+					// get the packets to play (since it's the same stream for audio and video, we just loop once throught the video stream)
+					List<AMFPacket> inputPackets = videoSource.getPlayPackets();
+					if ( inputPackets==null || inputPackets.size()==0 ) {
+						logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": No packets to play");
+					} else {
+						// calculate current loop span
+						int startIdx = (int) (Long.max(audioSeq, videoSeq) - inputPackets.get(0).getSeq() + 1);
+						if (startIdx < 0) startIdx = 0;
+						// temp variables for max timecodes and sequences for this iteration
+						long maxAudioTC = -1, maxVideoTC = -1, maxAudioSeq = -1, maxVideoSeq = -1;
+						// add the most recent packets to the output list
+						for (int i = startIdx; i < inputPackets.size() ; i++) {
+							AMFPacket packet = inputPackets.get(i).clone(true);
+							// update the packet's timecode
+							packet.setAbsTimecode(packet.getAbsTimecode() + audioTCOffset);
+							switch (packet.getType()) {
+								case IVHost.CONTENTTYPE_AUDIO:
+									// add the packet if it wasn't already added last time
+									if ( packet.getSeq()>audioSeq || packet.getAbsTimecode()>audioTC ) {
+										// update the maximums
+										if (packet.getAbsTimecode() > maxAudioTC) maxAudioTC = packet.getAbsTimecode();
+										if (packet.getSeq() > maxAudioSeq) maxAudioSeq = packet.getSeq();
+										// add the packet to the playback queue
+										packets.add(packet);
+									}
+									break;
+								case IVHost.CONTENTTYPE_VIDEO:
+									// add the packet if it wasn't already added last time
+									if ( packet.getSeq()>videoSeq || packet.getAbsTimecode()>videoTC ) {
+										// update the maximums
+										if (packet.getAbsTimecode() > maxVideoTC) maxVideoTC = packet.getAbsTimecode();
+										if (packet.getSeq() > maxVideoSeq) maxVideoSeq = packet.getSeq();
+										// add the packet to the playback queue
+										packets.add(packet);
+									}
+									break;
+								default:
+									// ignore unknown packets
+							}
+						}
+						// store max sequences and timecodes
+						audioTC = Long.max(audioTC,maxAudioTC);
+						videoTC = Long.max(videoTC,maxVideoTC);
+						audioSeq = Long.max(audioSeq,maxAudioSeq);
+						videoSeq = Long.max(videoSeq,maxVideoSeq);
+					}
+				} else {
+					// if we have what to play on video
+					if (videoSource != null) {
+						// get the packets to play
+						List<AMFPacket> inputPackets = videoSource.getPlayPackets();
+						if ( inputPackets==null || inputPackets.size()==0 ) {
+							logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": No packets to play on video");
+						} else {
+							// calculate current loop span
+							int startIdx = (int) (videoSeq - inputPackets.get(0).getSeq() + 1);
+							if (startIdx < 0) startIdx = 0;
+							// temp variables for max timecodes and sequences for this iteration
+							long maxVideoTC = -1, maxVideoSeq = -1;
+							// add the most recent packets to the output list
+							for (int i = startIdx; i < inputPackets.size() ; i++) {
+								AMFPacket packet = inputPackets.get(i).clone(true);
+								// first update the packet's timecode
+								packet.setAbsTimecode(packet.getAbsTimecode() + videoTCOffset);
+								switch (packet.getType()) {
+									case IVHost.CONTENTTYPE_VIDEO:
+										// add the packet if it wasn't already added last time
+										if ( packet.getSeq()>videoSeq || packet.getAbsTimecode()>videoTC ) {
+											// update the maximums
+											if (packet.getAbsTimecode() > maxVideoTC) maxVideoTC = packet.getAbsTimecode();
+											if (packet.getSeq() > maxVideoSeq) maxVideoSeq = packet.getSeq();
+											// add the packet
+											packets.add(packet);
+											
+										}
+										break;
+									default:
+										// ignore other types of packets
+								}
+							}
+							// store max sequences and timecodes
+							videoTC = Long.max(videoTC,maxVideoTC);
+							videoSeq = Long.max(videoSeq,maxVideoSeq);
+						}
+					}
+					
+					// if we have what to play on audio
+					if (audioSource != null) {
+						// get the packets to play
+						List<AMFPacket> inputPackets = audioSource.getPlayPackets();
+						if ( inputPackets==null || inputPackets.size()==0 ) {
+							logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": No packets to play on audio");
+						} else {
+							// calculate current loop span
+							int startIdx = (int) (audioSeq - inputPackets.get(0).getSeq() + 1);
+							if (startIdx < 0) startIdx = 0;
+							// temp variables for max timecodes and sequences for this iteration
+							long maxAudioTC = -1, maxAudioSeq = -1;
+							// add the most recent packets to the output list
+							for (int i = startIdx; i < inputPackets.size() ; i++) {
+								AMFPacket packet = inputPackets.get(i).clone(true);
+								// first update the packet's timecode
+								packet.setAbsTimecode(packet.getAbsTimecode() + audioTCOffset);
+								switch (packet.getType()) {
+									case IVHost.CONTENTTYPE_AUDIO:
+										// add the packet if it wasn't already added last time
+										if ( packet.getSeq()>audioSeq || packet.getAbsTimecode()>audioTC ) {
+											// update the maximums
+											if (packet.getAbsTimecode() > maxAudioTC) maxAudioTC = packet.getAbsTimecode();
+											if (packet.getSeq() > maxAudioSeq) maxAudioSeq = packet.getSeq();
+											// add the packet to the playback queue
+											packets.add(packet);
+										}
+										break;
+									default:
+										// ignore other types of packets
+								}
+							}
+							// store max sequences and timecodes
+							audioTC = Long.max(audioTC,maxAudioTC);
+							audioSeq = Long.max(audioSeq,maxAudioSeq);
+						}
+					}
+				}
+
+				// logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Current timecodes: { audio: " + audioTC + ", video: " + videoTC + " }");
+				
+				// create publisher if it doesn't exist, but we have packets
+				if (packets.size()>0 && publisher==null) {
+					if (!initPublisher()) {
+						// shut down due to lack of publisher
+						logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Shutting down outputstream for lack of publisher");
+						shutDown();
+						break;
+					}
+				}
+				
+				if (publisher != null) {
+					// as long as there is a packet
+					while (packets.peek() != null) {
+						// get the next packet
+						AMFPacket packet = packets.poll();
+						// logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Writing packet " + getPacketTypeString(packet.getType()) + " " + packet);
+						// output the packet
+						switch (packet.getType()) {
+							case IVHost.CONTENTTYPE_AUDIO:
+								publisher.addAudioData(packet.getData(), packet.getSize(), packet.getAbsTimecode());
+								// look for discontinuities
+								if (packet.getAbsTimecode() > maxSentAudioTC) maxSentAudioTC = packet.getAbsTimecode();
+								else logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Timecode discontinuity (audio) " + packet.getAbsTimecode() + " vs " + maxSentAudioTC);
+								break;
+							case IVHost.CONTENTTYPE_VIDEO:
+								publisher.addVideoData(packet.getData(), packet.getSize(), packet.getAbsTimecode());
+								// look for discontinuities
+								if (packet.getAbsTimecode() > maxSentVideoTC) maxSentVideoTC = packet.getAbsTimecode();
+								else logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Timecode discontinuity (video) " + packet.getAbsTimecode() + " vs " + maxSentVideoTC);
+								break;
+							default:
+								// just add them as data packets
+								publisher.addDataData(packet.getData(), packet.getSize(), packet.getAbsTimecode());
+						}
+					}
+				}
+				
+				// shut down if nothing to do
+				if (packets.isEmpty() && videoSource == null && audioSource == null && switchTC == Long.MAX_VALUE) {
+					// shut it down after a while of doing nothing
+					if (idleTime > idleShutdown) {
+						logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Shutting down outputstream for lack of work");
+						shutDown();
+						break;
+					}
+					// increment the idle time (ignoring any actual execution time which is negligible)
+					idleTime += sleepTime;
+				} else {
+					idleTime = 0;
+				}
+				
+				try {
+					Thread.sleep(sleepTime);
+				} catch (InterruptedException e) {
+					logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Outputstream interrupted");
+				}
 			}
-			else if (sortDelay >= 0 && packet.getAbsTimecode() > now - sortDelay)
-			{
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " no packets available. (packet.getAbsTimecode() > now - sortDelay) timecode: " + packet.getAbsTimecode() + ", now: " + now + ", sortDelay: " + sortDelay + "]",
-							WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-			}
-
-			long timecode = packet.getAbsTimecode();
-			byte[] data = packet.getData();
-
-			if (publisher == null)
-			{
-				if (!initPublisher())
-					return;
-			}
-
-			switch (packet.getType())
-			{
-			case IVHost.CONTENTTYPE_AUDIO:
-				publisher.addAudioData(data, timecode);
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add output audio packet. " + packet + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-
-			case IVHost.CONTENTTYPE_VIDEO:
-				publisher.addVideoData(data, timecode);
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add output video packet. " + packet + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-
-			case IVHost.CONTENTTYPE_DATA0:
-			case IVHost.CONTENTTYPE_DATA3:
-				publisher.addDataData(data, timecode);
-				if (debugLog)
-					logger.info(CLASS_NAME + ".processOutput(): " + "[" + appInstance.getContextStr() + "/" + outputName + " add output data packet. " + packet + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
-				break;
-			}
-			lastTC = packet.getAbsTimecode();
-			packets.remove();
+		} catch (Exception e) {
+			logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Error for output stream " + e.getMessage() + "\nStacktrace:\n" + getStackString(e));
+		} finally {
+			shutDown();
 		}
 	}
-
+	
 	private boolean initPublisher()
 	{
+		// checking if stream already exists
 		IMediaStream stream = appInstance.getStreams().getStream(outputName);
 		if (stream != null)
 		{
-			logger.error(CLASS_NAME + ".init(): " + "Cannot create Publisher. Stream already exists [" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+			logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Cannot create Publisher. Stream already exists");
 			return false;
 		}
-
+		// creating publisher
 		publisher = Publisher.createInstance(appInstance);
-		if (publisher != null)
-		{
+		if (publisher != null) {
+			// publish stream
 			publisher.setStreamType(appInstance.getStreamType());
 			publisher.publish(outputName);
+			// grabbing the sleep time from the stream config flush interval
 			stream = publisher.getStream();
-			stream.setMergeOnMetadata(appInstance.getProperties().getPropertyBoolean("avMixMergeMetadata", true));
-			flushInterval = stream.getProperties().getPropertyLong("flushInterval", appInstance.getProperties().getPropertyLong("avMixflushInterval", flushInterval));
-			logger.info(CLASS_NAME + ".init(): " + "Publisher created [" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+			// keep metadata up to date
+			stream.setMergeOnMetadata(true);
+			// grabbing the sleep time from the stream config flush interval
+			sleepTime = stream.getProperties().getPropertyInt("flushInterval", sleepTime);
+			logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Publisher created. Thread sleep time set to " + sleepTime);
 			return true;
 		}
-		logger.error(CLASS_NAME + ".init(): " + "Cannot create Publisher [" + appInstance.getContextStr() + "/" + outputName + "]", WMSLoggerIDs.CAT_application, WMSLoggerIDs.EVT_comment);
+		logger.error(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Cannot create Publisher");
 		return false;
 	}
-
-	public String getAudioName()
-	{
+	
+	private void sendConfirmation(String targetStream, String videoName, String audioName) {
+		
+		if (targetStream == null) return;
+		
+		boolean overlayActive = false;
+		
+		if (StreamCreatorConsumer.getInstance().getOverlayedStreams().containsValue(targetStream)) {
+			targetStream = targetStream.replace("-overlay","");
+			overlayActive = true;
+		}
+		
+		String actualAudioName = audioName;
+		String actualVideoName = videoName;
+		
+		Stream actualStream = StreamCreatorConsumer.getInstance().getAudioStreamList().get(appInstance.getContextStr() + "/" + targetStream);
+		if (actualStream != null) {
+			PlaylistItem item = actualStream.getCurrentItem();
+			if (item != null)
+				actualAudioName = actualStream.getCurrentItem().getName();
+		}
+		
+		actualStream = StreamCreatorConsumer.getInstance().getVideoStreamList().get(appInstance.getContextStr() + "/" + targetStream);
+		if (actualStream != null) {
+			PlaylistItem item = actualStream.getCurrentItem();
+			if (item != null)
+				actualVideoName = actualStream.getCurrentItem().getName();
+		}
+		
+		String routingKey = routingKeyTemplate;
+		try {
+			String[] pieces = targetStream.split("_");
+			Integer presentationId = Integer.decode(pieces[pieces.length -1]);
+			routingKey = MessageFormat.format(routingKeyTemplate, presentationId);
+		} catch (Exception e) {
+			logger.error(CLASS_NAME+".sendConfirmation: cannot get presentation id from stream " + targetStream + ". Error: " + e.getMessage());
+		}
+		
+		Channel channel = RabbitSingleton.getInstance().getRabbitChannel();
+		
+		if (channel != null && channel.isOpen()) {
+			StreamConfirmData data = new StreamConfirmData();
+			data.setAppName(appInstance.getContextStr());
+			data.setStreamName(targetStream);
+			data.setVideoName(actualVideoName);
+			data.setAudioName(actualAudioName);
+			data.setvHostName(vHostName);
+			data.setServerName(serverName);
+			data.setOverlayActive(overlayActive);
+			StreamConfirmMessage message = new StreamConfirmMessage();
+			message.setData(data);
+			message.setTimestamp(Instant.now().getEpochSecond());
+			message.setType(MessageType.SWITCH_CONFIRM);
+			try {
+				channel.basicPublish(exchangeName, routingKey, null, json.writeValueAsBytes(message));
+				logger.info(CLASS_NAME+".sent confirmation message: " + json.writeValueAsString(message) + " on exchange name " + exchangeName + " and routing key " + routingKey);
+			} catch (Exception e) {
+				logger.error(CLASS_NAME+".sendConfirmation: " + e.getMessage());
+			}
+		} else {
+			logger.error(CLASS_NAME+".sendConfirmation: channel to rabbit is unexplicably closed");
+		}
+	}
+	
+	private void shutDown() {
+		// clean up the publisher
+		if (publisher != null) {
+			publisher.unpublish();
+			publisher.close();
+		}
+		publisher = null;
+		running = false;
+	}
+	
+	public String getAudioName() {
 		return audioName;
 	}
 
-	public void setAudioName(String audioSourceName)
-	{
-		audioName = audioSourceName;
+	public void setAudioName(String audioName) {
+		if (audioName != null)
+			synchronized (lock) {
+				this.audioName = audioName;
+				logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] " + ": Audio name updated to " + audioName);
+			}
 	}
 
-	public String getVideoName()
-	{
+	public String getVideoName() {
 		return videoName;
 	}
 
-	public void setVideoName(String videoSourceName)
-	{
-		videoName = videoSourceName;
+	public void setVideoName(String videoName) {
+		if (videoName != null)
+			synchronized (lock) {
+				this.videoName = videoName;
+				nxtVideoSource = null;
+				switchTC = Long.MAX_VALUE;
+				logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] "+ ": Video name updated to " + videoName);
+			}
+	}
+	
+	public void setAudioVideoName(String name) {
+		if (name != null)
+			synchronized (lock) {
+				this.audioName = name;
+				this.videoName = name;
+				nxtVideoSource = null;
+				switchTC = Long.MAX_VALUE;
+				logger.info(CLASS_NAME + this.hashCode() + " [ " + appInstance.getContextStr() + "/" + outputName + " ] "+ ": Video and audio names updated to " + name);
+			}
 	}
 
-	public String getOutputName()
-	{
+	public String getOutputName() {
 		return outputName;
 	}
 
-	public Publisher getPublisher()
-	{
-		return publisher;
+	public void setOutputName(String outputName) {
+		this.outputName = outputName;
 	}
 
-	public long getSortDelay()
-	{
-		return sortDelay;
-	}
-
-	public void setSortDelay(long sortDelay)
-	{
-		this.sortDelay = sortDelay;
-	}
-
-	public long getSleepTime()
-	{
-		return flushInterval;
-	}
-
-	public void setSleepTime(long sleepTime)
-	{
-		flushInterval = sleepTime;
-	}
-
-	public boolean isAddAudioData()
-	{
-		return addAudioData;
-	}
-
-	public void setAddAudioData(boolean addAudioData)
-	{
-		this.addAudioData = addAudioData;
-	}
-
-	public boolean isAddVideoData()
-	{
-		return addVideoData;
-	}
-
-	public void setAddVideoData(boolean addVideoData)
-	{
-		this.addVideoData = addVideoData;
-	}
-
-	public boolean isWaitForKeyframe()
-	{
-		return waitForKeyframe;
-	}
-
-	public void setWaitForKeyframe(boolean waitForKeyframe)
-	{
-		this.waitForKeyframe = waitForKeyframe;
-	}
-
-	public boolean isUseOriginalTimecodes()
-	{
-		return useOriginalTimecodes;
-	}
-
-	public void setUseOriginalTimecodes(boolean useOriginalTimecodes)
-	{
-		this.useOriginalTimecodes = useOriginalTimecodes;
-	}
-
-	public boolean isDebugLog()
-	{
-		return debugLog;
-	}
-
-	public void setDebugLog(boolean debugLog)
-	{
-		this.debugLog = debugLog;
-	}
-
-	public void close()
-	{
-		synchronized(this)
-		{
+	public void close() {
+		synchronized(lock) {
 			doQuit = true;
 			interrupt();
 		}
 	}
 
-	public boolean isRunning()
-	{
-		synchronized(this)
-		{
+	public boolean isRunning() {
+		synchronized(lock) {
 			return running;
+		}
+	}
+	
+	private String getStackString(Exception e) {
+		StringWriter writer = new StringWriter();
+		PrintWriter printWriter = new PrintWriter(writer);
+		e.printStackTrace(printWriter);
+		printWriter.flush();
+		return writer.toString();
+	}
+	
+	private String getPacketTypeString(int type) {
+		switch (type) {
+			case IVHost.CONTENTTYPE_VIDEO:
+				return "video";
+			case IVHost.CONTENTTYPE_AUDIO:
+				return "audio";
+			case IVHost.CONTENTTYPE_DATA:
+			case IVHost.CONTENTTYPE_DATA3:
+				return "data";
+			default:
+				return "other";
 		}
 	}
 }
